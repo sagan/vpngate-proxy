@@ -54,8 +54,11 @@ BEFORE_IP="$(global_ip)"
 
 # start proxy (HTTP/HTTPS/SOCKS5 on TCP 8118, MASQUE on UDP 8118)
 vproxy run --bind 0.0.0.0:8118 auto &
-sleep 1
-vproxy run --bind 0.0.0.0:8118 quic &
+if [ "$VPNGATE_PROXY_UDP" = "1" ]
+then
+  sleep 1
+  vproxy run --bind 0.0.0.0:8118 quic &
+fi
 
 # connect vpn
 connect &
