@@ -1,0 +1,17 @@
+[package]
+name = "vpngate-proxy"
+version = "0.2.0"
+edition = "2024"
+description = "Control process for vpngate-proxy"
+
+[dependencies]
+base64 = "0.22"
+libc = "0.2"
+rand = "0.9"
+signal-hook = "0.4"
+ureq = { version = "3", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
