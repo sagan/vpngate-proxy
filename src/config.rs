@@ -16,6 +16,7 @@ pub struct Config {
     pub vpn_startup_timeout: Duration,
     pub vpn_check_interval: Duration,
     pub vpn_poll_interval: Duration,
+    pub failed_server_ttl: Duration,
 }
 
 impl Config {
@@ -40,6 +41,7 @@ impl Config {
             vpn_startup_timeout: Duration::from_secs(30),
             vpn_check_interval: Duration::from_secs(60),
             vpn_poll_interval: Duration::from_secs(5),
+            failed_server_ttl: Duration::from_secs(15 * 60),
         }
     }
 }

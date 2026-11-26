@@ -1,7 +1,9 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rand::seq::SliceRandom;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VpnServer {
@@ -9,6 +11,105 @@ pub struct VpnServer {
     pub ip: String,
     pub country_short: String,
     pub ovpn_config: Vec<u8>,
+}
+
+/// Tracks recently failed VPN servers and prioritizes candidates in the same
+/// subnet as the last connected server to minimize IP hopping.
+pub struct ServerSelector {
+    failed: HashMap<String, Instant>,
+    failed_ttl: Duration,
+    last_connected_ip: Option<Ipv4Addr>,
+}
+
+impl ServerSelector {
+    pub fn new(failed_ttl: Duration) -> Self {
+        Self {
+            failed: HashMap::new(),
+            failed_ttl,
+            last_connected_ip: None,
+        }
+    }
+
+    pub fn record_failure(&mut self, ip: &str, now: Instant) {
+        self.failed.insert(ip.to_string(), now);
+    }
+
+    pub fn record_success(&mut self, ip: &str) {
+        self.failed.remove(ip);
+        if let Ok(parsed) = ip.parse::<Ipv4Addr>() {
+            self.last_connected_ip = Some(parsed);
+        }
+    }
+
+    pub fn failed_count(&self) -> usize {
+        self.failed.len()
+    }
+
+    pub fn prune_expired(&mut self, now: Instant) {
+        self.failed
+            .retain(|_, failed_at| now.saturating_duration_since(*failed_at) < self.failed_ttl);
+    }
+
+    /// Filters out recently failed servers (falling back to all servers if every
+    /// candidate failed recently) and orders them by subnet affinity to
+    /// `last_connected_ip`: same `/24`, then same `/16`, then others.
+    /// Within each tier, candidates are shuffled randomly.
+    pub fn prioritize(&mut self, servers: Vec<VpnServer>, now: Instant) -> Vec<VpnServer> {
+        self.prune_expired(now);
+
+        let mut available: Vec<VpnServer> = servers
+            .iter()
+            .filter(|s| !self.failed.contains_key(&s.ip))
+            .cloned()
+            .collect();
+
+        if available.is_empty() && !servers.is_empty() {
+            eprintln!(
+                "All {} candidate servers recently failed; clearing failure history to retry",
+                servers.len()
+            );
+            self.failed.clear();
+            available = servers;
+        }
+
+        let Some(anchor) = self.last_connected_ip else {
+            available.shuffle(&mut rand::rng());
+            return available;
+        };
+
+        let anchor_octets = anchor.octets();
+        let mut same_24 = Vec::new();
+        let mut same_16 = Vec::new();
+        let mut others = Vec::new();
+
+        for server in available {
+            match server.ip.parse::<Ipv4Addr>() {
+                Ok(ip) => {
+                    let octets = ip.octets();
+                    if octets[0] == anchor_octets[0]
+                        && octets[1] == anchor_octets[1]
+                        && octets[2] == anchor_octets[2]
+                    {
+                        same_24.push(server);
+                    } else if octets[0] == anchor_octets[0] && octets[1] == anchor_octets[1] {
+                        same_16.push(server);
+                    } else {
+                        others.push(server);
+                    }
+                }
+                Err(_) => others.push(server),
+            }
+        }
+
+        let mut rng = rand::rng();
+        same_24.shuffle(&mut rng);
+        same_16.shuffle(&mut rng);
+        others.shuffle(&mut rng);
+
+        same_24.extend(same_16);
+        same_24.extend(others);
+        same_24
+    }
 }
 
 pub fn build_http_agent(timeout: Duration) -> ureq::Agent {
@@ -51,8 +152,7 @@ pub fn fetch_servers(
         .read_to_string()
         .map_err(|e| format!("reading VPNGate CSV failed: {e}"))?;
 
-    let mut servers = parse_vpngate_csv(&body, country_upper);
-    servers.shuffle(&mut rand::rng());
+    let servers = parse_vpngate_csv(&body, country_upper);
     Ok(servers)
 }
 
@@ -122,5 +222,66 @@ mod tests {
         assert_eq!(servers[0].ip, "1.1.1.1");
         assert_eq!(servers[0].country_short, "JP");
         assert_eq!(servers[0].ovpn_config, b"client\ndev tun\n");
+    }
+
+    fn make_server(ip: &str) -> VpnServer {
+        VpnServer {
+            host_name: format!("vpn-{ip}"),
+            ip: ip.to_string(),
+            country_short: "JP".to_string(),
+            ovpn_config: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_selector_excludes_failed_and_expires() {
+        let ttl = Duration::from_secs(60);
+        let mut selector = ServerSelector::new(ttl);
+        let t0 = Instant::now();
+
+        selector.record_failure("1.1.1.1", t0);
+        let servers = vec![make_server("1.1.1.1"), make_server("2.2.2.2")];
+
+        let picked = selector.prioritize(servers.clone(), t0 + Duration::from_secs(10));
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].ip, "2.2.2.2");
+
+        // After TTL expires, 1.1.1.1 is eligible again.
+        let picked_after = selector.prioritize(servers, t0 + Duration::from_secs(61));
+        assert_eq!(picked_after.len(), 2);
+    }
+
+    #[test]
+    fn test_selector_falls_back_when_all_failed() {
+        let mut selector = ServerSelector::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+        selector.record_failure("1.1.1.1", t0);
+        selector.record_failure("2.2.2.2", t0);
+
+        let servers = vec![make_server("1.1.1.1"), make_server("2.2.2.2")];
+        let picked = selector.prioritize(servers, t0 + Duration::from_secs(5));
+        assert_eq!(picked.len(), 2);
+        assert_eq!(selector.failed_count(), 0);
+    }
+
+    #[test]
+    fn test_selector_prioritizes_same_subnet() {
+        let mut selector = ServerSelector::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        selector.record_success("10.20.30.1");
+        // Simulate 10.20.30.1 later disconnecting so it is excluded on switch.
+        selector.record_failure("10.20.30.1", t0);
+
+        let servers = vec![
+            make_server("192.168.1.1"), // other
+            make_server("10.20.99.5"),  // same /16
+            make_server("10.20.30.1"),  // recently failed
+            make_server("10.20.30.42"), // same /24
+        ];
+
+        let picked = selector.prioritize(servers, t0 + Duration::from_secs(1));
+        let ips: Vec<&str> = picked.iter().map(|s| s.ip.as_str()).collect();
+        assert_eq!(ips, vec!["10.20.30.42", "10.20.99.5", "192.168.1.1"]);
     }
 }

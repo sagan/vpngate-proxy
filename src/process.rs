@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::vpngate::{VpnServer, fetch_global_ip, fetch_servers};
+use crate::vpngate::{ServerSelector, VpnServer, fetch_global_ip, fetch_servers};
 
 pub struct ManagedChild {
     name: String,
@@ -142,6 +142,7 @@ pub fn run_vpn_loop(
     shutdown: &AtomicBool,
 ) {
     let ovpn_path = PathBuf::from("/tmp/vpngate-active.ovpn");
+    let mut selector = ServerSelector::new(config.failed_server_ttl);
 
     while !shutdown.load(Ordering::Relaxed) {
         println!("Fetching VPNGate server list for country={}...", config.country);
@@ -162,13 +163,28 @@ pub fn run_vpn_loop(
             }
         };
 
-        println!("Found {} candidate servers", servers.len());
+        let total = servers.len();
+        let mut remaining = selector.prioritize(servers, Instant::now());
+        println!(
+            "Found {total} servers ({} eligible after excluding {} recently failed)",
+            remaining.len(),
+            selector.failed_count()
+        );
 
-        for server in &servers {
-            if shutdown.load(Ordering::Relaxed) {
-                break;
+        while !remaining.is_empty() && !shutdown.load(Ordering::Relaxed) {
+            let server = remaining.remove(0);
+            let was_connected = run_single_server(
+                config,
+                agent,
+                before_ip,
+                &server,
+                &ovpn_path,
+                &mut selector,
+                shutdown,
+            );
+            if was_connected && !remaining.is_empty() {
+                remaining = selector.prioritize(remaining, Instant::now());
             }
-            run_single_server(config, agent, before_ip, server, &ovpn_path, shutdown);
         }
 
         if !shutdown.load(Ordering::Relaxed) {
@@ -184,11 +200,13 @@ fn run_single_server(
     before_ip: &str,
     server: &VpnServer,
     ovpn_path: &Path,
+    selector: &mut ServerSelector,
     shutdown: &AtomicBool,
-) {
+) -> bool {
     if let Err(err) = write_ovpn_config(ovpn_path, &server.ovpn_config) {
         eprintln!("{err}");
-        return;
+        selector.record_failure(&server.ip, Instant::now());
+        return false;
     }
     let _guard = TempFileGuard(ovpn_path.to_path_buf());
 
@@ -202,7 +220,8 @@ fn run_single_server(
         Ok(child) => child,
         Err(err) => {
             eprintln!("{err}");
-            return;
+            selector.record_failure(&server.ip, Instant::now());
+            return false;
         }
     };
 
@@ -217,12 +236,14 @@ fn run_single_server(
         match vpn.try_wait() {
             Ok(Some(status)) => {
                 eprintln!("openvpn exited during startup with {status}");
-                return;
+                selector.record_failure(&server.ip, Instant::now());
+                return false;
             }
             Ok(None) => {}
             Err(err) => {
                 eprintln!("{err}");
-                return;
+                selector.record_failure(&server.ip, Instant::now());
+                return false;
             }
         }
 
@@ -242,7 +263,7 @@ fn run_single_server(
 
     if shutdown.load(Ordering::Relaxed) {
         vpn.terminate(Duration::from_secs(5));
-        return;
+        return false;
     }
 
     if !connected {
@@ -251,8 +272,11 @@ fn run_single_server(
             config.vpn_startup_timeout, server.host_name
         );
         vpn.terminate(Duration::from_secs(5));
-        return;
+        selector.record_failure(&server.ip, Instant::now());
+        return false;
     }
+
+    selector.record_success(&server.ip);
 
     // Connected: monitor periodically until shutdown, process exit, or IP leak/failure.
     let mut consecutive_failures = 0u32;
@@ -263,7 +287,8 @@ fn run_single_server(
         match vpn.try_wait() {
             Ok(Some(status)) => {
                 eprintln!("openvpn exited with {status}");
-                return;
+                selector.record_failure(&server.ip, Instant::now());
+                return true;
             }
             Ok(None) => {}
             Err(err) => {
@@ -293,4 +318,8 @@ fn run_single_server(
     }
 
     vpn.terminate(Duration::from_secs(5));
+    if !shutdown.load(Ordering::Relaxed) {
+        selector.record_failure(&server.ip, Instant::now());
+    }
+    true
 }
