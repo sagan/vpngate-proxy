@@ -2,7 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rand::seq::SliceRandom;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +122,7 @@ pub fn build_http_agent(timeout: Duration) -> ureq::Agent {
 pub fn fetch_global_ip(agent: &ureq::Agent, url: &str) -> Result<String, String> {
     let mut resp = agent
         .get(url)
+        .header("User-Agent", "curl/8.0")
         .call()
         .map_err(|e| format!("GET {url} failed: {e}"))?;
 
@@ -130,10 +131,16 @@ pub fn fetch_global_ip(agent: &ureq::Agent, url: &str) -> Result<String, String>
         .read_to_string()
         .map_err(|e| format!("reading response from {url} failed: {e}"))?;
 
+    parse_ip_response(&body, url)
+}
+
+pub fn parse_ip_response(body: &str, url: &str) -> Result<String, String> {
     let ip = body.trim();
     if ip.is_empty() {
         return Err(format!("empty IP response from {url}"));
     }
+    ip.parse::<IpAddr>()
+        .map_err(|_| format!("invalid IP response from {url}: {ip:?}"))?;
     Ok(ip.to_string())
 }
 
@@ -283,5 +290,15 @@ mod tests {
         let picked = selector.prioritize(servers, t0 + Duration::from_secs(1));
         let ips: Vec<&str> = picked.iter().map(|s| s.ip.as_str()).collect();
         assert_eq!(ips, vec!["10.20.30.42", "10.20.99.5", "192.168.1.1"]);
+    }
+
+    #[test]
+    fn test_parse_ip_response() {
+        assert_eq!(
+            parse_ip_response("203.0.113.5\n", "http://inet-ip.info").unwrap(),
+            "203.0.113.5"
+        );
+        assert!(parse_ip_response("<!doctype html><html></html>", "http://inet-ip.info").is_err());
+        assert!(parse_ip_response("   ", "http://inet-ip.info").is_err());
     }
 }
