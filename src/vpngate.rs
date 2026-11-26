@@ -41,6 +41,10 @@ impl ServerSelector {
         }
     }
 
+    pub fn clear_affinity(&mut self) {
+        self.last_connected_ip = None;
+    }
+
     pub fn failed_count(&self) -> usize {
         self.failed.len()
     }
@@ -55,21 +59,50 @@ impl ServerSelector {
     /// `last_connected_ip`: same `/24`, then same `/16`, then others.
     /// Within each tier, candidates are shuffled randomly.
     pub fn prioritize(&mut self, servers: Vec<VpnServer>, now: Instant) -> Vec<VpnServer> {
+        self.prioritize_excluding(servers, now, None)
+    }
+
+    /// Same as [`prioritize`](Self::prioritize), additionally excluding `exclude_ip`
+    /// unless it is the only available candidate.
+    pub fn prioritize_excluding(
+        &mut self,
+        servers: Vec<VpnServer>,
+        now: Instant,
+        exclude_ip: Option<&str>,
+    ) -> Vec<VpnServer> {
         self.prune_expired(now);
 
         let mut available: Vec<VpnServer> = servers
             .iter()
-            .filter(|s| !self.failed.contains_key(&s.ip))
+            .filter(|s| !self.failed.contains_key(&s.ip) && exclude_ip != Some(s.ip.as_str()))
             .cloned()
             .collect();
 
         if available.is_empty() && !servers.is_empty() {
-            eprintln!(
-                "All {} candidate servers recently failed; clearing failure history to retry",
-                servers.len()
-            );
-            self.failed.clear();
-            available = servers;
+            if let Some(excluded) = exclude_ip {
+                let others: Vec<VpnServer> = servers
+                    .iter()
+                    .filter(|s| s.ip != excluded)
+                    .cloned()
+                    .collect();
+                if !others.is_empty() {
+                    eprintln!(
+                        "All other candidate servers recently failed; clearing failure history to retry"
+                    );
+                    self.failed.clear();
+                    available = others;
+                } else {
+                    self.failed.clear();
+                    available = servers;
+                }
+            } else {
+                eprintln!(
+                    "All {} candidate servers recently failed; clearing failure history to retry",
+                    servers.len()
+                );
+                self.failed.clear();
+                available = servers;
+            }
         }
 
         let Some(anchor) = self.last_connected_ip else {
@@ -294,6 +327,52 @@ mod tests {
         let picked = selector.prioritize(servers, t0 + Duration::from_secs(1));
         let ips: Vec<&str> = picked.iter().map(|s| s.ip.as_str()).collect();
         assert_eq!(ips, vec!["10.20.30.42", "10.20.99.5", "192.168.1.1"]);
+    }
+
+    #[test]
+    fn test_selector_clear_affinity_and_exclude_current() {
+        let mut selector = ServerSelector::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        selector.record_success("10.20.30.1");
+        selector.clear_affinity();
+
+        let servers = vec![
+            make_server("10.20.30.1"),
+            make_server("10.20.30.42"),
+            make_server("192.168.1.1"),
+        ];
+
+        let picked = selector.prioritize_excluding(
+            servers.clone(),
+            t0 + Duration::from_secs(1),
+            Some("10.20.30.1"),
+        );
+        assert_eq!(picked.len(), 2);
+        assert!(picked.iter().all(|s| s.ip != "10.20.30.1"));
+
+        // Even if all other servers recently failed, excluding current clears failures and avoids current.
+        selector.record_failure("10.20.30.42", t0);
+        selector.record_failure("192.168.1.1", t0);
+        let picked_retry = selector.prioritize_excluding(
+            servers,
+            t0 + Duration::from_secs(2),
+            Some("10.20.30.1"),
+        );
+        assert_eq!(picked_retry.len(), 2);
+        assert!(picked_retry.iter().all(|s| s.ip != "10.20.30.1"));
+        assert_eq!(selector.failed_count(), 0);
+    }
+
+    #[test]
+    fn test_selector_exclude_only_server_falls_back() {
+        let mut selector = ServerSelector::new(Duration::from_secs(60));
+        let t0 = Instant::now();
+
+        let servers = vec![make_server("10.20.30.1")];
+        let picked = selector.prioritize_excluding(servers, t0, Some("10.20.30.1"));
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].ip, "10.20.30.1");
     }
 
     #[test]

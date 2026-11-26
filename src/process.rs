@@ -62,9 +62,9 @@ impl Drop for ManagedChild {
     }
 }
 
-pub fn sleep_interruptible(duration: Duration, shutdown: &AtomicBool) -> bool {
+pub fn sleep_interruptible_any(duration: Duration, flags: &[&AtomicBool]) -> bool {
     let deadline = Instant::now() + duration;
-    while !shutdown.load(Ordering::Relaxed) {
+    while !flags.iter().any(|f| f.load(Ordering::Relaxed)) {
         let now = Instant::now();
         if now >= deadline {
             return true;
@@ -73,6 +73,10 @@ pub fn sleep_interruptible(duration: Duration, shutdown: &AtomicBool) -> bool {
         thread::sleep(step);
     }
     false
+}
+
+pub fn sleep_interruptible(duration: Duration, shutdown: &AtomicBool) -> bool {
+    sleep_interruptible_any(duration, &[shutdown])
 }
 
 pub fn spawn_vproxy_supervisor(
@@ -135,16 +139,29 @@ impl Drop for TempFileGuard {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ServerOutcome {
+    Failed { was_connected: bool },
+    SwitchRequested,
+    Shutdown,
+}
+
 pub fn run_vpn_loop(
     config: &Config,
     agent: &ureq::Agent,
     before_ip: &str,
     shutdown: &AtomicBool,
+    switch_server: &AtomicBool,
 ) {
     let ovpn_path = PathBuf::from("/tmp/vpngate-active.ovpn");
     let mut selector = ServerSelector::new(config.failed_server_ttl);
+    let mut exclude_ip: Option<String> = None;
 
     while !shutdown.load(Ordering::Relaxed) {
+        if switch_server.swap(false, Ordering::AcqRel) {
+            selector.clear_affinity();
+        }
+
         println!("Fetching VPNGate server list for country={}...", config.country);
         let servers = match fetch_servers(agent, &config.vpngate_url, &config.country) {
             Ok(list) if !list.is_empty() => list,
@@ -153,42 +170,61 @@ pub fn run_vpn_loop(
                     "No VPNGate servers found for country={}, retrying in 10s",
                     config.country
                 );
-                sleep_interruptible(Duration::from_secs(10), shutdown);
+                sleep_interruptible_any(Duration::from_secs(10), &[shutdown, switch_server]);
                 continue;
             }
             Err(err) => {
                 eprintln!("Failed to fetch VPNGate server list: {err}; retrying in 10s");
-                sleep_interruptible(Duration::from_secs(10), shutdown);
+                sleep_interruptible_any(Duration::from_secs(10), &[shutdown, switch_server]);
                 continue;
             }
         };
 
+        // Coalesce any SIGHUP received while fetching the fresh list into this refresh.
+        if switch_server.swap(false, Ordering::AcqRel) {
+            selector.clear_affinity();
+        }
+
         let total = servers.len();
-        let mut remaining = selector.prioritize(servers, Instant::now());
+        let mut remaining =
+            selector.prioritize_excluding(servers, Instant::now(), exclude_ip.as_deref());
+        exclude_ip = None;
         println!(
             "Found {total} servers ({} eligible after excluding {} recently failed)",
             remaining.len(),
             selector.failed_count()
         );
 
+        let mut refresh_now = false;
         while !remaining.is_empty() && !shutdown.load(Ordering::Relaxed) {
             let server = remaining.remove(0);
-            let was_connected = run_single_server(
+            match run_single_server(
                 config,
                 before_ip,
                 &server,
                 &ovpn_path,
                 &mut selector,
                 shutdown,
-            );
-            if was_connected && !remaining.is_empty() {
-                remaining = selector.prioritize(remaining, Instant::now());
+                switch_server,
+            ) {
+                ServerOutcome::Shutdown => break,
+                ServerOutcome::SwitchRequested => {
+                    selector.clear_affinity();
+                    exclude_ip = Some(server.ip);
+                    refresh_now = true;
+                    break;
+                }
+                ServerOutcome::Failed { was_connected } => {
+                    if was_connected && !remaining.is_empty() {
+                        remaining = selector.prioritize(remaining, Instant::now());
+                    }
+                }
             }
         }
 
-        if !shutdown.load(Ordering::Relaxed) {
+        if !shutdown.load(Ordering::Relaxed) && !refresh_now {
             println!("Exhausted server list, refreshing...");
-            sleep_interruptible(Duration::from_secs(3), shutdown);
+            sleep_interruptible_any(Duration::from_secs(3), &[shutdown, switch_server]);
         }
     }
 }
@@ -200,11 +236,21 @@ fn run_single_server(
     ovpn_path: &Path,
     selector: &mut ServerSelector,
     shutdown: &AtomicBool,
-) -> bool {
+    switch_server: &AtomicBool,
+) -> ServerOutcome {
+    if shutdown.load(Ordering::Relaxed) {
+        return ServerOutcome::Shutdown;
+    }
+    if switch_server.swap(false, Ordering::AcqRel) {
+        return ServerOutcome::SwitchRequested;
+    }
+
     if let Err(err) = write_ovpn_config(ovpn_path, &server.ovpn_config) {
         eprintln!("{err}");
         selector.record_failure(&server.ip, Instant::now());
-        return false;
+        return ServerOutcome::Failed {
+            was_connected: false,
+        };
     }
     let _guard = TempFileGuard(ovpn_path.to_path_buf());
 
@@ -219,7 +265,9 @@ fn run_single_server(
         Err(err) => {
             eprintln!("{err}");
             selector.record_failure(&server.ip, Instant::now());
-            return false;
+            return ServerOutcome::Failed {
+                was_connected: false,
+            };
         }
     };
 
@@ -227,21 +275,28 @@ fn run_single_server(
     let startup_deadline = Instant::now() + config.vpn_startup_timeout;
     let mut connected = false;
 
-    while !shutdown.load(Ordering::Relaxed) && Instant::now() < startup_deadline {
-        if !sleep_interruptible(config.vpn_poll_interval, shutdown) {
+    while !shutdown.load(Ordering::Relaxed)
+        && !switch_server.load(Ordering::Relaxed)
+        && Instant::now() < startup_deadline
+    {
+        if !sleep_interruptible_any(config.vpn_poll_interval, &[shutdown, switch_server]) {
             break;
         }
         match vpn.try_wait() {
             Ok(Some(status)) => {
                 eprintln!("openvpn exited during startup with {status}");
                 selector.record_failure(&server.ip, Instant::now());
-                return false;
+                return ServerOutcome::Failed {
+                    was_connected: false,
+                };
             }
             Ok(None) => {}
             Err(err) => {
                 eprintln!("{err}");
                 selector.record_failure(&server.ip, Instant::now());
-                return false;
+                return ServerOutcome::Failed {
+                    was_connected: false,
+                };
             }
         }
 
@@ -261,7 +316,16 @@ fn run_single_server(
 
     if shutdown.load(Ordering::Relaxed) {
         vpn.terminate(Duration::from_secs(5));
-        return false;
+        return ServerOutcome::Shutdown;
+    }
+
+    if switch_server.swap(false, Ordering::AcqRel) {
+        println!(
+            "Received SIGHUP during startup; disconnecting from {} ({}) and switching to a new random server",
+            server.host_name, server.ip
+        );
+        vpn.terminate(Duration::from_secs(5));
+        return ServerOutcome::SwitchRequested;
     }
 
     if !connected {
@@ -271,22 +335,26 @@ fn run_single_server(
         );
         vpn.terminate(Duration::from_secs(5));
         selector.record_failure(&server.ip, Instant::now());
-        return false;
+        return ServerOutcome::Failed {
+            was_connected: false,
+        };
     }
 
     selector.record_success(&server.ip);
 
-    // Connected: monitor periodically until shutdown, process exit, or IP leak/failure.
+    // Connected: monitor periodically until shutdown, SIGHUP switch, process exit, or IP leak/failure.
     let mut consecutive_failures = 0u32;
-    while !shutdown.load(Ordering::Relaxed) {
-        if !sleep_interruptible(config.vpn_check_interval, shutdown) {
+    while !shutdown.load(Ordering::Relaxed) && !switch_server.load(Ordering::Relaxed) {
+        if !sleep_interruptible_any(config.vpn_check_interval, &[shutdown, switch_server]) {
             break;
         }
         match vpn.try_wait() {
             Ok(Some(status)) => {
                 eprintln!("openvpn exited with {status}");
                 selector.record_failure(&server.ip, Instant::now());
-                return true;
+                return ServerOutcome::Failed {
+                    was_connected: true,
+                };
             }
             Ok(None) => {}
             Err(err) => {
@@ -316,8 +384,66 @@ fn run_single_server(
     }
 
     vpn.terminate(Duration::from_secs(5));
-    if !shutdown.load(Ordering::Relaxed) {
-        selector.record_failure(&server.ip, Instant::now());
+    if shutdown.load(Ordering::Relaxed) {
+        return ServerOutcome::Shutdown;
     }
-    true
+    if switch_server.swap(false, Ordering::AcqRel) {
+        println!(
+            "Received SIGHUP; disconnected from {} ({}), switching to a new random server",
+            server.host_name, server.ip
+        );
+        return ServerOutcome::SwitchRequested;
+    }
+    selector.record_failure(&server.ip, Instant::now());
+    ServerOutcome::Failed {
+        was_connected: true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sleep_interruptible_any_wakes_on_switch_signal() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let switch_server = Arc::new(AtomicBool::new(false));
+
+        let switch_clone = Arc::clone(&switch_server);
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(50));
+            switch_clone.store(true, Ordering::Relaxed);
+        });
+
+        let start = Instant::now();
+        let completed =
+            sleep_interruptible_any(Duration::from_secs(10), &[&shutdown, &switch_server]);
+        let elapsed = start.elapsed();
+
+        handle.join().unwrap();
+        assert!(!completed);
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_SIGHUP_sets_switch_flag() {
+        let switch_server = Arc::new(AtomicBool::new(false));
+        let sig_id = signal_hook::flag::register(
+            signal_hook::consts::SIGHUP,
+            Arc::clone(&switch_server),
+        )
+        .expect("failed to register SIGHUP");
+
+        unsafe {
+            libc::raise(libc::SIGHUP);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !switch_server.load(Ordering::Relaxed) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        signal_hook::low_level::unregister(sig_id);
+
+        assert!(switch_server.load(Ordering::Relaxed));
+    }
 }

@@ -31,3 +31,11 @@ $ curl inet-ip.info
 $ curl inet-ip.info -x http://localhost:8118
 $ curl inet-ip.info -x socks5://localhost:8118
 ```
+
+# VPNサーバの切り替え
+
+コンテナに `SIGUSR1` シグナルを送ると、現在のOpenVPN接続を切断して新しいランダムなVPNサーバへ切り替えます。
+
+```bash
+docker kill -s SIGUSR1 <container_name_or_id>
+```

@@ -23,6 +23,13 @@ fn main() {
         }
     }
 
+    let switch_server = Arc::new(AtomicBool::new(false));
+    if let Err(err) =
+        signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&switch_server))
+    {
+        eprintln!("Warning: failed to register signal handler for SIGHUP: {err}");
+    }
+
     setup_policy_routing();
 
     let agent = build_http_agent(config.http_timeout);
@@ -66,7 +73,7 @@ fn main() {
         ));
     }
 
-    run_vpn_loop(&config, &agent, &before_ip, &shutdown);
+    run_vpn_loop(&config, &agent, &before_ip, &shutdown, &switch_server);
 
     println!("Shutting down...");
     shutdown.store(true, Ordering::Relaxed);
