@@ -31,7 +31,7 @@ fn main() {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
-        match fetch_global_ip(&agent, &config.ip_check_url) {
+        match fetch_global_ip(config.http_timeout, &config.ip_check_url) {
             Ok(ip) => break ip,
             Err(err) => {
                 eprintln!("Failed to determine initial global IP: {err}; retrying in 5s");

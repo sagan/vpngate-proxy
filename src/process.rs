@@ -175,7 +175,6 @@ pub fn run_vpn_loop(
             let server = remaining.remove(0);
             let was_connected = run_single_server(
                 config,
-                agent,
                 before_ip,
                 &server,
                 &ovpn_path,
@@ -196,7 +195,6 @@ pub fn run_vpn_loop(
 
 fn run_single_server(
     config: &Config,
-    agent: &ureq::Agent,
     before_ip: &str,
     server: &VpnServer,
     ovpn_path: &Path,
@@ -247,7 +245,7 @@ fn run_single_server(
             }
         }
 
-        match fetch_global_ip(agent, &config.ip_check_url) {
+        match fetch_global_ip(config.http_timeout, &config.ip_check_url) {
             Ok(after_ip) => {
                 println!("before={before_ip} after={after_ip}");
                 if after_ip != before_ip {
@@ -297,7 +295,7 @@ fn run_single_server(
             }
         }
 
-        match fetch_global_ip(agent, &config.ip_check_url) {
+        match fetch_global_ip(config.http_timeout, &config.ip_check_url) {
             Ok(after_ip) => {
                 println!("before={before_ip} after={after_ip}");
                 if after_ip == before_ip {

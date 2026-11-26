@@ -119,10 +119,14 @@ pub fn build_http_agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
-pub fn fetch_global_ip(agent: &ureq::Agent, url: &str) -> Result<String, String> {
+pub fn fetch_global_ip(timeout: Duration, url: &str) -> Result<String, String> {
+    // Use a fresh agent and Connection: close so every IP check opens a new
+    // TCP socket and follows the current routing table (eth0 vs tun0).
+    let agent = build_http_agent(timeout);
     let mut resp = agent
         .get(url)
         .header("User-Agent", "curl/8.0")
+        .header("Connection", "close")
         .call()
         .map_err(|e| format!("GET {url} failed: {e}"))?;
 
